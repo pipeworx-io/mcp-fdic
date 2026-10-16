@@ -695,6 +695,20 @@ async function pwFetch(url: string | URL, init?: RequestInit): Promise<Response>
 // is why the move went unnoticed; point at the real host directly.
 const BASE = 'https://api.fdic.gov/banks';
 
+// FDIC's own /failures response names when its search index was last built
+// (meta.index.createTimestamp) and that build can freeze for weeks while the
+// agency keeps publishing new failures elsewhere — found 2026-10-16 (fleet
+// #3162): the index built 2026-08-25 silently missed Tioga-Franklin Savings
+// Bank (2026-08-21, inside the window but apparently not yet captured) and
+// Nano Banc (2026-09-25), undercounting 2026 failures 4 vs the true 6. A 200
+// with a plausible, wrong, non-empty count is exactly the silent-staleness
+// shape this fleet watches for. FDIC's own Failed Bank List — the page it
+// publishes for human readers, updated same-day per its own Last-Modified
+// header — is the authoritative total; reconcile every call against it
+// rather than trusting the search index alone.
+const FAILED_BANK_LIST_URL = 'https://www.fdic.gov/bank-failures/download-data.csv';
+const STALE_INDEX_WARN_DAYS = 14;
+
 // ── Tool definitions ──────────────────────────────────────────────────
 
 const tools: McpToolExport['tools'] = [
@@ -754,7 +768,7 @@ const tools: McpToolExport['tools'] = [
   {
     name: 'fdic_failures',
     description:
-      'Search FDIC bank failures by date range. Returns bank name, location, CERT ID, failure date, acquiring institution, and fund type.',
+      'Search FDIC bank failures by date range. Returns bank name, location, CERT ID, failure date, acquiring institution, and fund type, reconciled against FDIC\'s published Failed Bank List with a `data_as_of` date and a `warning` field when FDIC\'s own search index is lagging.',
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -924,6 +938,129 @@ function toIsoDate(raw: string, endOfYear: boolean): string {
   );
 }
 
+// BankFind's /failures FAILDATE is M/D/YYYY, not ISO. Normalise so a
+// reconciled list never has to lexically sort two different date formats
+// against each other (toIsoDate already accepts 1-2 digit month/day).
+function normalizeApiFailDate(raw: unknown): string | null {
+  if (typeof raw !== 'string' || !raw) return null;
+  try {
+    return toIsoDate(raw, false);
+  } catch {
+    return raw;
+  }
+}
+
+type FailureRecord = {
+  name: string | null;
+  cert: number | null;
+  city: string | null;
+  state: string | null;
+  failure_date: string | null;
+  acquiring_institution: string | null;
+  resolution_type: string | null;
+  fund: string | null;
+  total_deposits: number | null;
+  total_assets: number | null;
+  estimated_loss: number | null;
+};
+
+const FBL_MONTHS: Record<string, string> = {
+  jan: '01',
+  feb: '02',
+  mar: '03',
+  apr: '04',
+  may: '05',
+  jun: '06',
+  jul: '07',
+  aug: '08',
+  sep: '09',
+  oct: '10',
+  nov: '11',
+  dec: '12',
+};
+
+// Minimal quoted-CSV splitter — the Failed Bank List's "Acquiring
+// Institution" column routinely contains a comma inside quotes
+// (e.g. "The Farmers State Bank of Oakley, Kansas").
+function parseCsvLine(line: string): string[] {
+  const out: string[] = [];
+  let cur = '';
+  let inQuotes = false;
+  for (let i = 0; i < line.length; i++) {
+    const c = line[i];
+    if (inQuotes) {
+      if (c === '"') {
+        if (line[i + 1] === '"') {
+          cur += '"';
+          i++;
+        } else {
+          inQuotes = false;
+        }
+      } else {
+        cur += c;
+      }
+    } else if (c === '"') {
+      inQuotes = true;
+    } else if (c === ',') {
+      out.push(cur);
+      cur = '';
+    } else {
+      cur += c;
+    }
+  }
+  out.push(cur);
+  // FDIC ships the header (and some fields) with a non-breaking space
+  // (0xA0) right before the delimiter despite a "charset=UTF-8"
+  // Content-Type — strip it along with ordinary whitespace.
+  return out.map((s) => s.replace(/ /g, '').trim());
+}
+
+// "25-Sep-26" -> "2026-09-25". The published list only covers failures
+// since 2000, so a bare "-26" always means 2026, not 1926.
+function parseFailedBankListDate(raw: string): string | null {
+  const m = raw.trim().match(/^(\d{1,2})-([A-Za-z]{3})-(\d{2})$/);
+  if (!m) return null;
+  const mo = FBL_MONTHS[m[2].toLowerCase()];
+  if (!mo) return null;
+  return `${2000 + Number(m[3])}-${mo}-${m[1].padStart(2, '0')}`;
+}
+
+async function fetchFailedBankList(): Promise<{ rows: FailureRecord[]; data_as_of: string | null }> {
+  const res = await pwFetch(FAILED_BANK_LIST_URL, { headers: { Accept: 'text/csv' } });
+  if (!res.ok) {
+    throw new Error(`FDIC Failed Bank List error (${res.status})`);
+  }
+  const lastModified = res.headers.get('last-modified');
+  const text = await res.text();
+  const lines = text.split(/\r?\n/).filter((l) => l.trim().length > 0);
+  const rows: FailureRecord[] = [];
+  for (let i = 1; i < lines.length; i++) {
+    // Bank Name, City, State, Cert, Acquiring Institution, Closing Date, Fund
+    const cols = parseCsvLine(lines[i]);
+    if (cols.length < 6) continue;
+    const [name, city, state, certRaw, acquirer, closingDate, fund] = cols;
+    const iso = parseFailedBankListDate(closingDate);
+    if (!iso) continue;
+    rows.push({
+      name: name || null,
+      cert: certRaw ? Number(certRaw) : null,
+      city: city || null,
+      state: state || null,
+      failure_date: iso,
+      acquiring_institution: acquirer || null,
+      resolution_type: 'FAILURE',
+      fund: fund || null,
+      total_deposits: null,
+      total_assets: null,
+      estimated_loss: null,
+    });
+  }
+  return {
+    rows,
+    data_as_of: lastModified ? new Date(lastModified).toISOString() : null,
+  };
+}
+
 async function getFailures(limit: number, startDate?: string, endDate?: string) {
   let url = `/failures?sort_by=FAILDATE&sort_order=DESC&limit=${limit}`;
   // FAILDATE_MIN / FAILDATE_MAX are not real FDIC filter fields. The API
@@ -933,42 +1070,104 @@ async function getFailures(limit: number, startDate?: string, endDate?: string) 
   // unqualified `search` bug. The working form is an inclusive range query;
   // spot-check: 2023 -> 5 failures (SVB, Signature, First Republic, Heartland
   // Tri-State, Citizens), which matches the FDIC's published count.
+  const lo = startDate ? toIsoDate(startDate, false) : '1934-01-01';
+  const hi = endDate ? toIsoDate(endDate, true) : '2100-12-31';
   if (startDate || endDate) {
-    const lo = startDate ? toIsoDate(startDate, false) : '1934-01-01';
-    const hi = endDate ? toIsoDate(endDate, true) : '2100-12-31';
     url += `&filters=${encodeURIComponent(`FAILDATE:["${lo}" TO "${hi}"]`)}`;
   }
 
   const data = (await fdicGet(url)) as {
     data: { data: Record<string, unknown> }[];
     totals: { count: number };
+    meta?: { index?: { createTimestamp?: string } };
   };
 
+  const indexBuilt = data.meta?.index?.createTimestamp ?? null;
+
+  // Four more fields were named off the actual schema and so mapped to null
+  // on every row: state is PSTALP (not STALP), the acquirer is BIDNAME (not
+  // ACQUIRER), and deposits/assets at failure are QBFDEP/QBFASSET (not
+  // TOTALDEPOSITS/COST — COST is the estimated loss to the fund, which is
+  // usually null and is a different quantity entirely). FUND is a numeric
+  // code; SAVR carries the readable name ("DIF"), so surface both.
+  const apiFailures: FailureRecord[] = (data.data ?? []).map((row) => ({
+    name: (row.data.NAME as string) ?? null,
+    cert: (row.data.CERT as number) ?? null,
+    city: (row.data.CITY as string) ?? null,
+    state: (row.data.PSTALP as string) ?? null,
+    // BankFind's FAILDATE comes back as M/D/YYYY (e.g. "7/17/2026") while the
+    // Failed Bank List CSV below gives ISO. Normalise both to ISO at the
+    // source: a reconciled list that lexically sorted a mix of the two
+    // formats put Nano Banc (CSV, "2026-09-25") BEHIND four M/D/YYYY rows
+    // whose string value happened to sort higher — found by this pack's own
+    // test, not by a human proofreading the diff.
+    failure_date: normalizeApiFailDate(row.data.FAILDATE),
+    acquiring_institution: (row.data.BIDNAME as string) ?? null,
+    resolution_type: (row.data.RESTYPE as string) ?? null,
+    fund: (row.data.SAVR as string) ?? (row.data.FUND as string) ?? null,
+    total_deposits: (row.data.QBFDEP as number) ?? null,
+    total_assets: (row.data.QBFASSET as number) ?? null,
+    estimated_loss: (row.data.COST as number) ?? null,
+  }));
+
+  let merged = apiFailures;
+  let total = data.totals?.count ?? apiFailures.length;
+  let dataAsOf = new Date().toISOString();
+  let warning: string | null = null;
+
+  try {
+    const list = await fetchFailedBankList();
+    if (list.data_as_of) dataAsOf = list.data_as_of;
+    const inRange = list.rows.filter(
+      (r) => (r.failure_date as string) >= lo && (r.failure_date as string) <= hi,
+    );
+    const apiByCert = new Map(
+      apiFailures.filter((f) => f.cert != null).map((f) => [f.cert as number, f]),
+    );
+    const missingFromIndex = inRange.filter((r) => r.cert == null || !apiByCert.has(r.cert));
+
+    const reconciled = inRange
+      .map((r) => (r.cert != null ? apiByCert.get(r.cert) ?? r : r))
+      .sort((a, b) => String(b.failure_date).localeCompare(String(a.failure_date)));
+
+    merged = reconciled.slice(0, limit);
+    total = inRange.length;
+
+    if (missingFromIndex.length > 0) {
+      warning =
+        `FDIC's BankFind failures search index was last rebuilt ${indexBuilt ?? 'at an unknown time'} ` +
+        `and was missing ${missingFromIndex.length} more recent failure(s) not yet indexed ` +
+        `(e.g. ${missingFromIndex[0].name}, ${missingFromIndex[0].failure_date}). This response is ` +
+        `reconciled against FDIC's published Failed Bank List, current as of ${dataAsOf}.`;
+    } else if (indexBuilt) {
+      const ageDays = (Date.now() - new Date(indexBuilt).getTime()) / 86400000;
+      if (ageDays > STALE_INDEX_WARN_DAYS) {
+        warning =
+          `FDIC's BankFind failures search index was last rebuilt ${indexBuilt} ` +
+          `(${Math.round(ageDays)} days ago). Cross-checked against FDIC's published Failed Bank List ` +
+          `(current as of ${dataAsOf}) and found no additional failures.`;
+      }
+    }
+  } catch (e) {
+    // The cross-check itself failed (network, parse) — don't fail the whole
+    // call, the BankFind result is still real data, but say so loudly rather
+    // than silently keeping a result that might be stale with no signal.
+    warning =
+      `Could not cross-check against FDIC's published Failed Bank List (${(e as Error).message}). ` +
+      `This result reflects BankFind's search index only` +
+      `${indexBuilt ? ` (last rebuilt ${indexBuilt})` : ''} and may be stale.`;
+  }
+
   return {
-    total_failures: data.totals?.count ?? data.data?.length ?? 0,
+    total_failures: total,
+    data_as_of: dataAsOf,
+    bankfind_index_built: indexBuilt,
+    ...(warning ? { warning } : {}),
     filters: {
       start_date: startDate ?? null,
       end_date: endDate ?? null,
     },
-    // Four more fields were named off the actual schema and so mapped to null
-    // on every row: state is PSTALP (not STALP), the acquirer is BIDNAME (not
-    // ACQUIRER), and deposits/assets at failure are QBFDEP/QBFASSET (not
-    // TOTALDEPOSITS/COST — COST is the estimated loss to the fund, which is
-    // usually null and is a different quantity entirely). FUND is a numeric
-    // code; SAVR carries the readable name ("DIF"), so surface both.
-    failures: (data.data ?? []).map((row) => ({
-      name: row.data.NAME ?? null,
-      cert: row.data.CERT ?? null,
-      city: row.data.CITY ?? null,
-      state: row.data.PSTALP ?? null,
-      failure_date: row.data.FAILDATE ?? null,
-      acquiring_institution: row.data.BIDNAME ?? null,
-      resolution_type: row.data.RESTYPE ?? null,
-      fund: row.data.SAVR ?? row.data.FUND ?? null,
-      total_deposits: row.data.QBFDEP ?? null,
-      total_assets: row.data.QBFASSET ?? null,
-      estimated_loss: row.data.COST ?? null,
-    })),
+    failures: merged,
   };
 }
 

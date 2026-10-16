@@ -2,7 +2,7 @@
 
 The Federal Deposit Insurance Corporation's BankFind and Call Reports data. Quarterly Call Report financials for every FDIC-insured bank in the US (~4,500 institutions), plus failed bank lists, branch maps, and supervisory designations. Free, no auth.
 
-Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents to 1683+ live data sources.
+Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents to 1819+ live data sources. This is an independent, unofficial integration — not affiliated with, endorsed by, or published by the upstream provider.
 
 ## Why this matters for AI agents
 
@@ -40,6 +40,7 @@ For cross-source linking (Fed + FDIC + OCC), RSSD ID is the canonical key. Use i
 - **Call Report consolidation level.** Reports come at the bank-holding-company (BHC) level OR the individual-bank level. They don't aggregate cleanly — totals at one level can differ from sums at the other due to inter-affiliate transactions.
 - **Non-FDIC institutions.** Credit unions are NCUA-regulated, not FDIC. They don't appear here. Investment banks (without an insured depository subsidiary) also don't.
 - **Failed banks vs. unwound banks.** FDIC failure list = formal receivership. Other institutions exit the industry via voluntary liquidation, merger, or charter conversion — those don't appear as "failed."
+- **BankFind's own failures search index can lag.** It names its own last-build time, and that build has gone stale for weeks at a time (found 2026-10-16, fleet #3162: frozen since 2026-08-25, silently undercounting 2026 failures 4 vs the true 6). `fdic_failures` reconciles every call against FDIC's own published Failed Bank List and returns `data_as_of` plus a `warning` whenever the index is missing something newer or is more than two weeks stale.
 - **Capital ratio interpretation.** A bank's Tier 1 ratio of 11% is fine in normal times but stretched if loan losses spike. Look at trend, not just snapshot.
 - **Deposit concentration.** "Uninsured deposits" (>$250k) is a critical risk metric. Find it in the call report; raw "total deposits" alone misses the deposit-flight-risk story (cf. SVB).
 
@@ -87,7 +88,7 @@ directly, instead of just this one's:
 }
 ```
 
-Both URLs reach the same gateway and the same 1683+ data sources. The
+Both URLs reach the same gateway and the same 1819+ data sources. The
 only difference is which pack's tools are listed **directly**; `ask_pipeworx`
 reaches all of them from either one.
 
