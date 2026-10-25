@@ -2,7 +2,7 @@
 
 The Federal Deposit Insurance Corporation's BankFind and Call Reports data. Quarterly Call Report financials for every FDIC-insured bank in the US (~4,500 institutions), plus failed bank lists, branch maps, and supervisory designations. Free, no auth.
 
-Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents to 1866+ live data sources. This is an independent, unofficial integration — not affiliated with, endorsed by, or published by the upstream provider.
+Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents to 1879+ live data sources. This is an independent, unofficial integration — not affiliated with, endorsed by, or published by the upstream provider.
 
 ## Why this matters for AI agents
 
@@ -21,7 +21,15 @@ Used by the `fintech_bank_health_check` compound.
 
 None. FDIC's BankFind and Call Report APIs are fully public, free, no key.
 
+## Branch locations and Summary of Deposits
+
+- **`fdic_branches`** lists the current offices of FDIC-insured banks (address, county, latitude/longitude, main-office flag, service type, established date). Filter by `cert`, a bank `name` fragment, or `state` + `city`. Source: FDIC, BankFind institution locations. Reflects the FDIC's current locations file; `data_as_of` is its build time.
+- **`fdic_branch_deposits`** returns the FDIC Summary of Deposits: deposits at each branch as of June 30 of a survey year, in **thousands of US dollars**, ranked by branch deposits. `year` defaults to the latest published survey. Source: FDIC, Summary of Deposits.
+
+Identifiers: `cert` is the institution; `office_id` is the FDIC's unique office number and joins the two tools; `branch_number` is the bank's own branch number (0 is the main office). Current locations and Summary of Deposits are different vintages: a branch opened or closed since June 30 appears in one and not the other. US federal data, public domain.
+
 ## Update cadence
+
 
 Banks file Call Reports quarterly with a regulatory deadline of ~30 days after quarter-end. Public release follows within a few additional weeks. So Q1 data publicly visible by mid-May, Q2 by mid-August, etc. Pipeworx caches with TTLs aligned to release windows.
 
@@ -88,7 +96,7 @@ directly, instead of just this one's:
 }
 ```
 
-Both URLs reach the same gateway and the same 1866+ data sources. The
+Both URLs reach the same gateway and the same 1879+ data sources. The
 only difference is which pack's tools are listed **directly**; `ask_pipeworx`
 reaches all of them from either one.
 

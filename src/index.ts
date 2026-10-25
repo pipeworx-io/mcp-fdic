@@ -25,6 +25,93 @@ interface McpToolExport {
 }
 
 /**
+ * The class routing tokens, and the two safe ways to wrap a message carrying one.
+ *
+ * A pack signals an error's class with a leading token — `user_error:`,
+ * `upstream_down:`, `upstream_throttled:`, `not_found:`, `blocked_host:`. The
+ * gateway's classifier anchors on `^`, and `stripClassPrefix` (which hides the
+ * token from the caller) anchors on `^` too. So the convention has one failure
+ * mode, and it is silent: a catch block that wraps the message —
+ * `` `${slug}/${tool}: ${message}` `` — pushes the token off position 0. The
+ * error then books as `error` ("Pipeworx has a defect") instead of as the
+ * caller mistake it is, AND the raw token leaks into what the caller reads.
+ *
+ * Nothing about that fails loudly. The call still returns, the message still
+ * reads plausibly, and the misclassification only shows up as a pack sitting on
+ * the Problem Tools list for a bug it does not have. Found live in
+ * `medicaid-intelligence` on 2026-08-21; the same wrapper template is copied
+ * across 18 DMV packs, none of which emit a token *yet*.
+ *
+ * `scripts/check-error-class-prefix.mjs` is the gate that keeps this honest —
+ * it fails any pack that both emits a token and wraps a caught message without
+ * using one of the helpers below.
+ */
+
+/**
+ * The canonical token set. `workers/gateway/src/error-class.ts` carries its own
+ * copy on the read side (it is deliberately importable without pulling a pack
+ * in); the gate asserts the two agree, because this list has already drifted
+ * twice — `not_found:` and `blocked_host:` were honoured by the classifier and
+ * not stripped, so both went out to callers verbatim for months.
+ */
+const CLASS_TOKENS = [
+  'upstream_down',
+  'upstream_throttled',
+  'user_error',
+  'not_found',
+  'blocked_host',
+  // `blocked_url:` is emitted at position 0 from five sites in ssrf.ts
+  // (`assertPublicHttpUrl`, and every redirect hop in `safeFetch`) and was in
+  // NEITHER reader — so it went to callers verbatim for its whole life. Caught
+  // 2026-08-21 by a live n8n call, which answered a private instance_url with
+  // "…host). blocked_url: refusing to fetch non-public or non-https URL".
+  // Exactly the drift the gate now blocks.
+  'blocked_url',
+  // `auth_required:` joins the list 2026-08-29 (fleet #638). It exists for the
+  // same reason `user_error:` does: a bare 401/403 in an upstream body matches
+  // the `upstream_throttled` heuristic below before anything auth-specific, so
+  // a pack that needs to say "this is a credential problem, not a rate limit"
+  // has no wording-based route — only the explicit-prefix escape hatch works.
+  // tiingo and open-sanctions both reached for it on their own, on the
+  // (reasonable, but wrong at the time) assumption that any snake_case class
+  // already meant something to the gateway. Neither shipped a leak from
+  // MIS-CLASSIFICATION — the `error` field was already correct — the leak was
+  // the literal token riding along in `message`, unstripped, because this list
+  // didn't know the token either reader was seeing.
+  'auth_required',
+] as const;
+
+const CLASS_PREFIX_RE =
+  /^(?:upstream_down|upstream_throttled|user_error|not_found|blocked_host|blocked_url|auth_required)\s*:\s*/;
+
+/**
+ * Split a caught message into its leading routing token (possibly empty) and
+ * the human-readable body, so a wrapper can put the token back on the front.
+ *
+ *   const { token, body } = splitClassPrefix(message);
+ *   return { error: `${token}my-pack/${name}: ${body}` };
+ *
+ * The `${token}` must be the FIRST thing in the template — that is the whole
+ * point, and it is what the gate checks.
+ */
+function splitClassPrefix(message: string): { token: string; body: string } {
+  const token = message.match(CLASS_PREFIX_RE)?.[0] ?? '';
+  return { token, body: message.slice(token.length) };
+}
+
+/**
+ * Drop a leading routing token from a message that is about to become a
+ * FRAGMENT of a larger one — a per-mirror failure joined into "all providers
+ * failed (...)", say. Hoisting is wrong there: the fragment never reaches
+ * position 0, so the token cannot route anything and would only leak. The outer
+ * message declares its own class.
+ */
+function dropClassPrefix(message: string): string {
+  return message.replace(CLASS_PREFIX_RE, '');
+}
+
+
+/**
  * Was this failure OUR OWN web service? — the other half of `internal-db-class.ts`.
  *
  * fleet #1089 pulled failures from our own Postgres out of `upstream_down` by
@@ -295,10 +382,26 @@ async function httpErrorMessage(res: Response, name: string): Promise<string> {
   // internal-host-class.ts; no-op for every third-party upstream, which is why
   // this touches 481 packs' error text and changes none of it.
   return markInternalOrigin(
-    `${name}: ${res.status}${detailSuffix(await readDetail(res))}`,
+    `${name}: ${res.status}${detailSuffix(await readDetail(res))}${responseHints(res)}`,
     res.url,
     res.status,
   );
+}
+
+/**
+ * Facts about a FAILED response that live in its headers, not its body, appended
+ * so the gateway's classifier (which only ever sees this string) can tell a limit
+ * from a wall from a refusal (fleet #3477). Both are standard, both are absent on
+ * almost every response, and neither is invented: `Retry-After` is the server
+ * saying "come back later" (the one thing that makes a 403 a throttle), and
+ * Cloudflare marks a bot challenge with `cf-mitigated: challenge`.
+ */
+function responseHints(res: Response): string {
+  const hints: string[] = [];
+  const retryAfter = res.headers.get('retry-after');
+  if (retryAfter) hints.push(`retry-after: ${retryAfter.slice(0, 40)}`);
+  if ((res.headers.get('cf-mitigated') ?? '').toLowerCase() === 'challenge') hints.push('Cloudflare bot challenge (cf-mitigated: challenge)');
+  return hints.length ? ` (${hints.join('; ')})` : '';
 }
 
 /**
@@ -1058,6 +1161,38 @@ const tools: McpToolExport['tools'] = [
       required: [],
     },
   },
+  {
+    name: 'fdic_branches',
+    description:
+      'List the current branch and office locations of FDIC-insured banks: street address, city, state, ZIP, county, latitude/longitude, main-office flag, service type (full service, limited, etc.), and the date the office was established. Filter by FDIC certificate number (CERT), bank name, state, and/or city. Answers "where are Sturgis Bank & Trust\'s branches" and "all bank branches in Ottumwa, Iowa". Source: FDIC, BankFind institution locations. Use fdic_search_institutions to find a CERT from a name.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        cert: { type: 'string', description: 'FDIC certificate number (e.g. "14413" for Iowa State Bank and Trust Company of Fairfield)' },
+        name: { type: 'string', description: 'Bank name fragment (e.g. "Sturgis Bank"). Used when cert is not known.' },
+        state: { type: 'string', description: 'Two-letter state code (e.g. "MI")' },
+        city: { type: 'string', description: 'City name (e.g. "Sturgis")' },
+        limit: { type: 'number', description: 'Max offices to return (default 50, max 500)' },
+      },
+      required: [],
+    },
+  },
+  {
+    name: 'fdic_branch_deposits',
+    description:
+      'Summary of Deposits (SOD): deposits held at each branch of an FDIC-insured bank as of June 30 of a survey year, in thousands of US dollars, with the branch address, city, state, ZIP, and branch/office identifiers. Pass a cert (and optionally year, state, city); year defaults to the latest survey year published. Returns branches ranked by deposits, plus the sum of the branches returned. Source: FDIC, Summary of Deposits annual branch survey.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        cert: { type: 'string', description: 'FDIC certificate number (required unless state and city are both given)' },
+        year: { type: 'number', description: 'Survey year (June 30 snapshot), e.g. 2024. Omit for the latest published year.' },
+        state: { type: 'string', description: 'Two-letter state code of the branch (e.g. "IA")' },
+        city: { type: 'string', description: 'Branch city (e.g. "Ottumwa")' },
+        limit: { type: 'number', description: 'Max branches to return (default 50, max 500)' },
+      },
+      required: [],
+    },
+  },
 ];
 
 // ── callTool dispatcher ───────────────────────────────────────────────
@@ -1078,6 +1213,10 @@ async function callTool(name: string, args: Record<string, unknown>): Promise<un
       );
     case 'fdic_summary':
       return getSummary(args.date as string | undefined, args.state as string | undefined);
+    case 'fdic_branches':
+      return getBranches(args);
+    case 'fdic_branch_deposits':
+      return getBranchDeposits(args);
     default:
       throw new Error(`Unknown tool: ${name}`);
   }
@@ -1401,7 +1540,7 @@ async function getFailures(limit: number, startDate?: string, endDate?: string) 
     // call, the BankFind result is still real data, but say so loudly rather
     // than silently keeping a result that might be stale with no signal.
     warning =
-      `Could not cross-check against FDIC's published Failed Bank List (${(e as Error).message}). ` +
+      `Could not cross-check against FDIC's published Failed Bank List (${dropClassPrefix((e as Error).message)}). ` +
       `This result reflects BankFind's search index only` +
       `${indexBuilt ? ` (last rebuilt ${indexBuilt})` : ''} and may be stale.`;
   }
@@ -1522,6 +1661,165 @@ async function getSummary(date: string | undefined, state?: string): Promise<unk
       institution_count: rows.reduce((a, r) => a + ((r.institution_count as number) ?? 0), 0),
     },
     by_charter_class: rows,
+  };
+}
+
+// ── Branch locations and Summary of Deposits ────────────────────────
+
+function clampLimit(raw: unknown, dflt: number): number {
+  const n = Number(raw);
+  return Number.isFinite(n) && n > 0 ? Math.min(Math.floor(n), 500) : dflt;
+}
+
+/** Quote a user value for an FDIC filter expression; strips characters that would break the quoting. */
+function fq(v: unknown): string {
+  return `"${String(v).trim().replace(/["\\]/g, '')}"`;
+}
+
+type FdicRows = {
+  meta?: { index?: { createTimestamp?: string } };
+  data?: { data: Record<string, unknown> }[];
+  totals?: { count: number };
+};
+
+async function getBranches(args: Record<string, unknown>) {
+  const cert = args.cert != null && String(args.cert).trim() !== '' ? String(args.cert).trim() : '';
+  const name = typeof args.name === 'string' ? args.name.trim() : '';
+  const state = typeof args.state === 'string' ? args.state.trim().toUpperCase() : '';
+  const city = typeof args.city === 'string' ? args.city.trim() : '';
+  if (!cert && !name && !(state && city)) {
+    throw new Error('user_error: pass cert (FDIC certificate number), name (bank name), or both state and city. Use fdic_search_institutions to find a cert from a name.');
+  }
+  if (cert && !/^\d+$/.test(cert)) throw new Error(`user_error: cert must be digits, got "${cert}".`);
+  const limit = clampLimit(args.limit, 50);
+  const filters: string[] = [];
+  let matched: { cert: number; name: string }[] | undefined;
+  if (cert) filters.push(`CERT:${cert}`);
+  else if (name) {
+    // The locations index does not tokenise names, so resolve the name to
+    // certificate numbers through the institutions index and filter on those.
+    const inst = (await fdicGet(
+      `/institutions?search=${encodeURIComponent(`NAME:${name}`)}&filters=${encodeURIComponent('ACTIVE:1')}&fields=CERT,NAME&limit=3`,
+    )) as FdicRows;
+    matched = (inst.data ?? []).map((r) => ({ cert: Number(r.data.CERT), name: String(r.data.NAME ?? '') })).filter((m) => Number.isFinite(m.cert));
+    if (matched.length === 0) {
+      return {
+        found: false,
+        total_offices: 0,
+        empty_reason: 'no_institution_matched_name',
+        hint: `No active FDIC-insured institution matched the name "${name}". Try a shorter fragment, or fdic_search_institutions.`,
+        source: 'FDIC, BankFind institution locations',
+      };
+    }
+    filters.push(`CERT:(${matched.map((m) => m.cert).join(' OR ')})`);
+  }
+  if (state) filters.push(`STALP:${fq(state)}`);
+  if (city) filters.push(`CITY:${fq(city)}`);
+  const fields = 'CERT,NAME,OFFNAME,ADDRESS,ADDRESS2,CITY,STALP,ZIP,COUNTY,LATITUDE,LONGITUDE,MAINOFF,SERVTYPE_DESC,ESTYMD,OFFNUM,UNINUM,RUNDATE';
+  let url = `/locations?fields=${fields}&limit=${limit}&sort_by=OFFNUM&sort_order=ASC`;
+  if (filters.length) url += `&filters=${encodeURIComponent(filters.join(' AND '))}`;
+  const data = (await fdicGet(url)) as FdicRows;
+  const rows = (data.data ?? []).map((r) => r.data);
+  const total = data.totals?.count ?? rows.length;
+  if (rows.length === 0) {
+    return {
+      found: false,
+      total_offices: 0,
+      empty_reason: 'no_matching_offices',
+      hint: 'No FDIC-insured office matched. Check the cert with fdic_search_institutions; a closed or merged bank has no current offices. State is a 2-letter code.',
+      source: 'FDIC, BankFind institution locations',
+    };
+  }
+  return {
+    found: true,
+    ...(matched ? { matched_institutions: matched } : {}),
+    total_offices: total,
+    returned: rows.length,
+    truncated: total > rows.length,
+    offices: rows.map((o) => ({
+      cert: o.CERT != null ? Number(o.CERT) : null,
+      institution: o.NAME ?? null,
+      office_name: o.OFFNAME ?? null,
+      address: [o.ADDRESS, o.ADDRESS2].filter((x) => x).join(', ') || null,
+      city: o.CITY ?? null,
+      state: o.STALP ?? null,
+      zip: o.ZIP ?? null,
+      county: o.COUNTY ?? null,
+      latitude: o.LATITUDE ?? null,
+      longitude: o.LONGITUDE ?? null,
+      main_office: o.MAINOFF === 1,
+      service_type: o.SERVTYPE_DESC ?? null,
+      established: o.ESTYMD ?? null,
+      office_number: o.OFFNUM ?? null,
+      office_id: o.UNINUM ?? null,
+    })),
+    source: 'FDIC, BankFind institution locations',
+    data_as_of: data.meta?.index?.createTimestamp ?? null,
+  };
+}
+
+async function getBranchDeposits(args: Record<string, unknown>) {
+  const cert = args.cert != null && String(args.cert).trim() !== '' ? String(args.cert).trim() : '';
+  const state = typeof args.state === 'string' ? args.state.trim().toUpperCase() : '';
+  const city = typeof args.city === 'string' ? args.city.trim() : '';
+  if (!cert && !(state && city)) {
+    throw new Error('user_error: pass cert (FDIC certificate number), or both state and city. Use fdic_search_institutions to find a cert from a name.');
+  }
+  if (cert && !/^\d+$/.test(cert)) throw new Error(`user_error: cert must be digits, got "${cert}".`);
+  const limit = clampLimit(args.limit, 50);
+  const base: string[] = [];
+  if (cert) base.push(`CERT:${cert}`);
+  if (state) base.push(`STALPBR:${fq(state)}`);
+  if (city) base.push(`CITYBR:${fq(city)}`);
+
+  let year = args.year != null && String(args.year).trim() !== '' ? Number(args.year) : NaN;
+  if (args.year != null && String(args.year).trim() !== '' && !(year >= 1994 && year <= 2100)) {
+    throw new Error(`user_error: year must be a survey year from 1994 on, got "${args.year}".`);
+  }
+  if (!Number.isFinite(year)) {
+    const latest = (await fdicGet(`/sod?filters=${encodeURIComponent(base.join(' AND '))}&fields=YEAR&sort_by=YEAR&sort_order=DESC&limit=1`)) as FdicRows;
+    const y = latest.data?.[0]?.data?.YEAR;
+    if (typeof y !== 'number') {
+      return { found: false, empty_reason: 'no_summary_of_deposits_rows', hint: 'No Summary of Deposits rows for that bank or place in any year. Check the cert with fdic_search_institutions.', source: 'FDIC, Summary of Deposits' };
+    }
+    year = y;
+  }
+  const filters = [...base, `YEAR:${year}`].join(' AND ');
+  const fields = 'CERT,YEAR,NAMEFULL,NAMEBR,ADDRESBR,CITYBR,STALPBR,ZIPBR,CNTYNAMB,DEPSUMBR,BRNUM,UNINUMBR,BRSERTYP,SIMS_LATITUDE,SIMS_LONGITUDE';
+  const data = (await fdicGet(`/sod?filters=${encodeURIComponent(filters)}&fields=${fields}&sort_by=DEPSUMBR&sort_order=DESC&limit=${limit}`)) as FdicRows;
+  const rows = (data.data ?? []).map((r) => r.data);
+  const total = data.totals?.count ?? rows.length;
+  if (rows.length === 0) {
+    return { found: false, year, empty_reason: 'no_rows_for_year', hint: `No Summary of Deposits rows for survey year ${year}. Omit year for the latest published.`, source: 'FDIC, Summary of Deposits' };
+  }
+  const shown = rows.reduce((a, r) => a + (typeof r.DEPSUMBR === 'number' ? r.DEPSUMBR : 0), 0);
+  return {
+    found: true,
+    survey_year: year,
+    as_of_date: `${year}-06-30`,
+    units: 'US dollars, thousands',
+    total_branches: total,
+    returned: rows.length,
+    truncated: total > rows.length,
+    deposits_in_returned_branches: shown,
+    deposits_total_is_complete: total <= rows.length,
+    branches: rows.map((b) => ({
+      cert: b.CERT ?? null,
+      institution: b.NAMEFULL ?? null,
+      branch_name: b.NAMEBR ?? null,
+      address: b.ADDRESBR ?? null,
+      city: b.CITYBR ?? null,
+      state: b.STALPBR ?? null,
+      zip: b.ZIPBR ?? null,
+      county: b.CNTYNAMB ?? null,
+      branch_deposits: b.DEPSUMBR ?? null,
+      branch_number: b.BRNUM ?? null,
+      office_id: b.UNINUMBR ?? null,
+      latitude: b.SIMS_LATITUDE ?? null,
+      longitude: b.SIMS_LONGITUDE ?? null,
+    })),
+    source: 'FDIC, Summary of Deposits',
+    data_as_of: data.meta?.index?.createTimestamp ?? null,
   };
 }
 
