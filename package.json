@@ -1,6 +1,6 @@
 {
   "name": "@pipeworx/mcp-fdic",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "FDIC MCP — FDIC BankFind Suite API (free, no auth)",
   "type": "module",
   "main": "lib/index.js",
@@ -27,7 +27,7 @@
     "mode": "gateway",
     "slug": "fdic",
     "gatewaySlug": "fdic",
-    "sourceHash": "v1-26a399015df297f0a60bbf8f8ca39c5483e9bf9ee62c0c48f9ad44edc2d2eaa7",
-    "sourceCommit": "bb047243cf27f32453103de186b8e6a8b6a1ce79"
+    "sourceHash": "v1-dc866ce38d4a1d1f26c0a4fa86477a73757636a26911324f08e1360123650869",
+    "sourceCommit": "d35e32c1ffe988e24d391dedb35666387fd2b3d6"
   }
 }
